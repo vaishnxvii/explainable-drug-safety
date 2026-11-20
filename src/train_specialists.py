@@ -150,3 +150,5 @@ def build_features_and_train(data_path="data/processed/faers_clean_25k.csv", top
 
 if __name__ == "__main__":
     build_features_and_train()
+
+print('yoooo')
