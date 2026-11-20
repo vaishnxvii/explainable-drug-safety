@@ -6,6 +6,10 @@ import xgboost as xgb
 import shap
 from sklearn.model_selection import train_test_split
 from sklearn.calibration import CalibratedClassifierCV
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import make_pipeline
 from sklearn.metrics import roc_auc_score, average_precision_score, recall_score, brier_score_loss
 from sklearn.feature_extraction.text import CountVectorizer
 
@@ -19,7 +23,6 @@ def build_features_and_train(data_path="data/processed/faers_clean_25k.csv", top
     df = pd.read_csv(data_path)
     print(f"Loaded {len(df)} records from {data_path}")
 
-    # 1. Clinical Feature Engineering
     df["is_female"] = (df["sex"] == 2).astype(int)
     df["is_elderly"] = (df["age"] >= 65).astype(int)
     df["age_x_polypharmacy"] = df["age"] * df["polypharmacy_count"]
@@ -37,20 +40,20 @@ def build_features_and_train(data_path="data/processed/faers_clean_25k.csv", top
     X_drugs = pd.DataFrame(drug_matrix, columns=drug_cols, index=df.index)
     X = pd.concat([X_base, X_drugs], axis=1)
 
-    # Save background cohort sample (500 patients) for Global SHAP Summary Plots
     X_global_sample = X.sample(n=min(500, len(X)), random_state=42)
 
     all_reactions = df["reactions"].str.split("|").explode()
     clinical_reactions = all_reactions[~all_reactions.isin(NON_CLINICAL_TERMS)]
     target_adrs = clinical_reactions.value_counts().head(top_n_adrs).index.tolist()
-    print(f"\nSelected Target ADRs: {target_adrs}\n")
+    print(f"\nTraining Multi-Model Suite (XGBoost, Random Forest, Logistic Regression) for: {target_adrs}\n")
 
     os.makedirs("models", exist_ok=True)
     metadata = {
         "feature_columns": X.columns.tolist(),
         "drug_vocabulary": vectorizer.get_feature_names_out().tolist(),
         "target_adrs": target_adrs,
-        "metrics": {}
+        "available_models": ["XGBoost (Proposed)", "Random Forest", "Logistic Regression"],
+        "metrics": {m: {} for m in ["XGBoost (Proposed)", "Random Forest", "Logistic Regression"]}
     }
 
     for adr in target_adrs:
@@ -64,74 +67,86 @@ def build_features_and_train(data_path="data/processed/faers_clean_25k.csv", top
             X, y, test_size=0.2, random_state=42, stratify=y
         )
 
-        # Base XGBoost for tree structure & SHAP TreeExplainer
+        safe_adr = adr.lower().replace(" ", "_")
+
+        # 1. XGBoost (Proposed)
         base_xgb = xgb.XGBClassifier(
-            n_estimators=200,
-            max_depth=4,
-            learning_rate=0.05,
-            subsample=0.8,
-            colsample_bytree=0.8,
-            scale_pos_weight=scale_weight,
-            eval_metric="aucpr",
-            random_state=42,
-            n_jobs=-1
-        )
-        base_xgb.fit(X_train, y_train)
+            n_estimators=200, max_depth=4, learning_rate=0.05,
+            subsample=0.8, colsample_bytree=0.8,
+            scale_pos_weight=scale_weight, eval_metric="aucpr",
+            random_state=42, n_jobs=-1
+        ).fit(X_train, y_train)
 
-        # Calibrated Classifier (Platt Sigmoid Scaling) for true clinical probabilities
-        calibrator = CalibratedClassifierCV(
+        cal_xgb = CalibratedClassifierCV(
             estimator=xgb.XGBClassifier(
-                n_estimators=200,
-                max_depth=4,
-                learning_rate=0.05,
-                subsample=0.8,
-                colsample_bytree=0.8,
-                scale_pos_weight=scale_weight,
-                eval_metric="aucpr",
-                random_state=42,
-                n_jobs=-1
-            ),
-            method="sigmoid",
-            cv=3
-        )
-        calibrator.fit(X_train, y_train)
+                n_estimators=200, max_depth=4, learning_rate=0.05,
+                subsample=0.8, colsample_bytree=0.8,
+                scale_pos_weight=scale_weight, eval_metric="aucpr",
+                random_state=42, n_jobs=-1
+            ), method="sigmoid", cv=3
+        ).fit(X_train, y_train)
 
-        # Evaluate raw recall vs calibrated probability Brier score
-        y_raw_prob = base_xgb.predict_proba(X_test)[:, 1]
-        y_cal_prob = calibrator.predict_proba(X_test)[:, 1]
+        exp_xgb = shap.TreeExplainer(base_xgb)
 
-        roc_auc = roc_auc_score(y_test, y_cal_prob)
-        pr_auc = average_precision_score(y_test, y_cal_prob)
-        recall = recall_score(y_test, (y_raw_prob >= 0.5).astype(int))
-        brier_raw = brier_score_loss(y_test, y_raw_prob)
-        brier_cal = brier_score_loss(y_test, y_cal_prob)
+        # 2. Random Forest
+        base_rf = RandomForestClassifier(
+            n_estimators=150, max_depth=10, class_weight="balanced",
+            random_state=42, n_jobs=-1
+        ).fit(X_train, y_train)
 
-        print(
-            f"[{adr:<19}] BaseRate: {baseline_rate*100:4.1f}% | AUC: {roc_auc:.3f} | "
-            f"Recall: {recall:.3f} | Brier: {brier_raw:.3f} -> {brier_cal:.3f}"
-        )
+        cal_rf = CalibratedClassifierCV(
+            estimator=RandomForestClassifier(
+                n_estimators=150, max_depth=10, class_weight="balanced",
+                random_state=42, n_jobs=-1
+            ), method="sigmoid", cv=3
+        ).fit(X_train, y_train)
 
-        # Build SHAP TreeExplainer & precompute Global SHAP values on 500-patient cohort
-        explainer = shap.TreeExplainer(base_xgb)
-        global_shap_vals = explainer(X_global_sample)
+        exp_rf = shap.TreeExplainer(base_rf)
 
-        safe_name = adr.lower().replace(" ", "_")
-        joblib.dump(calibrator, f"models/cal_{safe_name}.joblib")
-        joblib.dump(explainer, f"models/shap_{safe_name}.joblib")
-        joblib.dump(global_shap_vals, f"models/global_shap_{safe_name}.joblib")
+        # 3. Logistic Regression
+        scaler = StandardScaler()
+        X_train_scaled = scaler.fit_transform(X_train)
+        base_lr = LogisticRegression(class_weight="balanced", max_iter=500, random_state=42).fit(X_train_scaled, y_train)
 
-        metadata["metrics"][adr] = {
-            "positives": pos_count,
-            "baseline_rate": round(float(baseline_rate * 100), 2),
-            "roc_auc": round(float(roc_auc), 4),
-            "pr_auc": round(float(pr_auc), 4),
-            "recall": round(float(recall), 4),
-            "brier_calibrated": round(float(brier_cal), 4)
+        cal_lr = CalibratedClassifierCV(
+            estimator=make_pipeline(StandardScaler(), LogisticRegression(class_weight="balanced", max_iter=500, random_state=42)),
+            method="sigmoid", cv=3
+        ).fit(X_train, y_train)
+
+        exp_lr = shap.LinearExplainer(base_lr, X_train_scaled)
+
+        # Save all 3 model families
+        suite = {
+            "XGBoost (Proposed)": ("xgb", base_xgb, cal_xgb, exp_xgb, None),
+            "Random Forest": ("rf", base_rf, cal_rf, exp_rf, None),
+            "Logistic Regression": ("lr", base_lr, cal_lr, exp_lr, scaler),
         }
+
+        for m_label, (prefix, raw_clf, cal_clf, explainer, sc) in suite.items():
+            y_raw_prob = raw_clf.predict_proba(scaler.transform(X_test) if sc else X_test)[:, 1]
+            y_cal_prob = cal_clf.predict_proba(X_test)[:, 1]
+
+            metadata["metrics"][m_label][adr] = {
+                "positives": pos_count,
+                "baseline_rate": round(float(baseline_rate * 100), 2),
+                "roc_auc": round(float(roc_auc_score(y_test, y_cal_prob)), 4),
+                "pr_auc": round(float(average_precision_score(y_test, y_cal_prob)), 4),
+                "recall": round(float(recall_score(y_test, (y_raw_prob >= 0.5).astype(int))), 4),
+                "brier_calibrated": round(float(brier_score_loss(y_test, y_cal_prob)), 4)
+            }
+
+            joblib.dump(cal_clf, f"models/cal_{prefix}_{safe_adr}.joblib")
+            joblib.dump(explainer, f"models/shap_{prefix}_{safe_adr}.joblib")
+            if sc is not None:
+                joblib.dump(sc, f"models/scaler_{safe_adr}.joblib")
+
+        # Keep global SHAP for XGBoost tab
+        joblib.dump(exp_xgb(X_global_sample), f"models/global_shap_{safe_adr}.joblib")
+        print(f"Trained & calibrated all 3 models for [{adr}]")
 
     joblib.dump(X_global_sample, "models/X_global_sample.joblib")
     joblib.dump(metadata, "models/pipeline_metadata.joblib")
-    print("\nAll Calibrated Specialist Models & Global SHAP artifacts saved in models/!")
+    print("\nAll multi-model calibrated artifacts saved in models/!")
 
 if __name__ == "__main__":
     build_features_and_train()
